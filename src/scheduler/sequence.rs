@@ -124,6 +124,39 @@ impl _Sequence {
         self.deref_mut().append_token_id(logprobs);
     }
 
+    /// Truncates this sequence's own token bookkeeping (`SequenceData` and
+    /// `logical_token_blocks`) down to `new_len` tokens, keeping only the
+    /// earliest `new_len`. Pairs with `BlockEngine::free_tail_blocks` for a
+    /// block-native KV-length shrink that keeps the *same* sequence (and
+    /// its retained physical blocks' KV content) rather than aborting and
+    /// re-registering — without this, `logical_token_blocks.len()` would
+    /// stay at the pre-truncation size while the physical block table
+    /// shrinks, confusing the scheduler's next-block-needed admission
+    /// check on this sequence's next decode step.
+    ///
+    /// Token *content* beyond what's kept from `prompt_token_ids` is
+    /// rebuilt as placeholder id `0`, not the original content — callers
+    /// that rely on real token content must not use this; it exists for
+    /// embeddings-driven callers that only need consistent
+    /// block-allocation bookkeeping, not real token ids.
+    pub fn truncate_to(&mut self, new_len: usize) {
+        {
+            let mut data = self.deref_mut();
+            let prompt_len = data.prompt_token_ids.len();
+            if new_len <= prompt_len {
+                data.prompt_token_ids.truncate(new_len);
+                data.output_token_ids.clear();
+            } else {
+                data.output_token_ids.truncate(new_len - prompt_len);
+            }
+            data.num_cached_tokens = data.num_cached_tokens.min(new_len);
+        }
+        self.logical_token_blocks.clear();
+        for _ in 0..new_len {
+            self.append_token_to_blocks(0);
+        }
+    }
+
     pub fn blocks_to_add_new_tok(&self) -> usize {
         let last = self.logical_token_blocks.last();
         if !last.is_some_and(|last| last.is_full() || last.is_empty()) {
