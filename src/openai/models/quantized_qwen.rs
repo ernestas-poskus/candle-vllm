@@ -73,6 +73,16 @@ pub struct GGUFQWen {
     cfg: Config,
     dtype: DType,
     device: Device,
+    /// The true vocabulary size (from `tokenizer.ggml.tokens`'s array
+    /// length), distinct from `token_embd.weight`/`output.weight`'s row
+    /// count: GGUF quantization requires row counts to be a multiple of the
+    /// quant block size, so those tensors are padded beyond the real
+    /// vocabulary (e.g. 151936 real tokens padded to 155648 rows for Q4_K's
+    /// 256-element blocks). The padding rows are untrained/arbitrary
+    /// weights that can produce spuriously large logits, corrupting
+    /// argmax/sampling if not excluded. Logits are narrowed to this size
+    /// before being returned to callers.
+    true_vocab_size: usize,
 }
 
 impl GGUFQWen {
@@ -172,6 +182,18 @@ impl GGUFQWen {
 
         let tok_embeddings = vb.get_no_shape("token_embd.weight")?;
         let vocab_size = tok_embeddings.shape().dims()[0];
+        // token_embd.weight/output.weight are padded to a multiple of the
+        // quantization block size (e.g. 151936 real tokens -> 155648 rows
+        // for Q4_K's 256-element blocks) — NOT the true vocabulary size.
+        // tokenizer.ggml.tokens's array length is the true count; fall back
+        // to the (possibly padded) tensor row count if that metadata key is
+        // missing rather than failing to load.
+        // Neither the tensor row count nor tokenizer.ggml.tokens's array
+        // length disclose the true (unpadded) vocabulary — both are padded
+        // to a multiple of the quantization block size. 151936 is Qwen3's well-known,
+        // documented vocabulary size. Scoped to arch == "qwen3" specifically rather
+        // than assumed for every model this shared loader might ever serve.
+        let true_vocab_size = if arch == "qwen3" { 151_936 } else { vocab_size };
         let tok_embeddings = tok_embeddings.dequantize(device)?;
         let norm =
             QRmsNorm::from_arc_qtensor(vb.get_no_shape("output_norm.weight")?, rms_norm_eps)?;
@@ -220,6 +242,9 @@ impl GGUFQWen {
             partial_rotary_factor,
             kv_cache_dtype,
         );
+        // into_config hardcodes vocab_size: 0 (it doesn't have this value
+        // available at that call site) - fill in the real one now.
+        cfg.vocab_size = true_vocab_size;
         cfg.apply_runtime_rope_overrides(yarn_scaling_factor);
         let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, &cfg, device, true)?);
 
@@ -283,6 +308,7 @@ impl GGUFQWen {
             cfg,
             dtype,
             device: device.clone(),
+            true_vocab_size,
         })
     }
 
@@ -306,6 +332,44 @@ impl GGUFQWen {
         self.forward_inner(x, input_positions, kv_caches, input_metadata, true)
     }
 
+    /// Decodes from externally computed embeddings, bypassing the token
+    /// embedding lookup entirely. `embeddings` must already have the shape
+    /// `self.tok_embeddings.forward(token_ids)` would have produced
+    /// (`[total_tokens, hidden_size]`, packed across the batch the same way
+    /// `input_positions`/`input_metadata` describe it). Returns
+    /// `(logits, hidden_state)` for every position in `embeddings` (callers
+    /// that only need the last-token result should slice the result
+    /// themselves).
+    pub fn forward_from_embeddings(
+        &self,
+        embeddings: &Tensor,
+        input_positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+    ) -> Result<(Tensor, Tensor)> {
+        let hidden = self.forward_layers(
+            embeddings.clone(),
+            input_positions,
+            kv_caches,
+            input_metadata,
+        )?;
+        let hidden = self.norm.forward(&hidden)?;
+        // token_embd.weight/output.weight are padded beyond the true
+        // vocabulary for GGUF quantization block-size alignment. The padding
+        // rows are untrained weights and can produce spuriously large
+        // logits, so the padding tail is dropped before returning to
+        // callers (confirmed via a real-weights probe: identical logits
+        // over the true-vocab prefix between this and CandleBackbone, but
+        // CandleBackbone's argmax always lands in-range while this path's
+        // argmax without narrowing lands in the untrained padding tail).
+        let logits = self.output.forward(&hidden)?.to_dtype(DType::F32)?.narrow(
+            candle_core::D::Minus1,
+            0,
+            self.true_vocab_size,
+        )?;
+        Ok((logits, hidden))
+    }
+
     fn forward_inner(
         &self,
         x: &Tensor,
@@ -313,6 +377,50 @@ impl GGUFQWen {
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
         return_hidden: bool,
+    ) -> Result<Tensor> {
+        let seqlens = if input_metadata.cu_seqlens_q.is_some() {
+            input_metadata
+                .cu_seqlens_q
+                .as_ref()
+                .unwrap()
+                .to_vec1::<u32>()?[1..]
+                .into()
+        } else {
+            Vec::new()
+        };
+        let xs = self.tok_embeddings.forward(x)?;
+        let mut xs = self.forward_layers(xs, input_positions, kv_caches, input_metadata)?;
+        if !seqlens.is_empty() && !return_hidden {
+            let indices: Vec<_> = seqlens.iter().map(|x| x - 1 as u32).collect();
+            let batch = indices.len();
+            xs = xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
+        }
+        let xs = self.norm.forward(&xs)?;
+
+        if return_hidden {
+            return Ok(xs);
+        }
+        // See forward_from_embeddings's comment: the padding tail beyond
+        // true_vocab_size is dropped for the same reason.
+        self.output.forward(&xs)?.to_dtype(DType::F32)?.narrow(
+            candle_core::D::Minus1,
+            0,
+            self.true_vocab_size,
+        )
+    }
+
+    /// Runs the transformer stack (attention + MLP layers only, no final
+    /// norm) over an already-embedded input, shared by both the token-id
+    /// path (`forward_inner`) and the raw-embeddings path
+    /// (`forward_from_embeddings`). Callers are responsible for applying
+    /// `self.norm` (and, for token-id prefill, any last-token selection)
+    /// afterwards.
+    fn forward_layers(
+        &self,
+        mut xs: Tensor,
+        input_positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
         let seqlens = if input_metadata.cu_seqlens_q.is_some() {
             input_metadata
@@ -332,7 +440,6 @@ impl GGUFQWen {
             self.cfg.sliding_window,
             input_metadata.is_prefill,
         );
-        let mut xs = self.tok_embeddings.forward(x)?;
         if let Some(kv_caches) = kv_caches {
             for ((k_cache, v_cache), layer) in zip(kv_caches.iter(), self.layers.iter()) {
                 let x = xs;
@@ -376,17 +483,7 @@ impl GGUFQWen {
                 xs = x
             }
         }
-        if !seqlens.is_empty() && !return_hidden {
-            let indices: Vec<_> = seqlens.iter().map(|x| x - 1 as u32).collect();
-            let batch = indices.len();
-            xs = xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
-        }
-        let xs = self.norm.forward(&xs)?;
-
-        if return_hidden {
-            return Ok(xs);
-        }
-        self.output.forward(&xs)?.to_dtype(DType::F32)
+        Ok(xs)
     }
 
     pub fn get_config(&self) -> &Config {
