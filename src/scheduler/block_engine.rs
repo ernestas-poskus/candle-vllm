@@ -591,6 +591,37 @@ impl BlockEngine {
         self.block_tables.remove(&sequence.deref_mut().get_id());
     }
 
+    /// Frees the trailing `num_blocks` physical blocks from `seq_id`'s block
+    /// table, returning the number actually freed (fewer than requested if
+    /// the table has fewer blocks than that). Unlike [`Self::free_sequence`],
+    /// this keeps the sequence's earlier (retained) blocks — and, crucially,
+    /// their already-computed KV content — completely untouched: no
+    /// forward pass, no re-prefill, just a block-table length change. This
+    /// is what makes it a safe, O(1) alternative to "abort the sequence and
+    /// replay a re-prefill of the retained prefix" for shrinking a
+    /// sequence's KV length. The caller is responsible for updating its own
+    /// bookkeeping (`context_len`, cached logits/hidden state, etc.) to
+    /// match the new, shorter length — this only frees the underlying
+    /// physical blocks.
+    pub fn free_tail_blocks(&mut self, seq_id: usize, num_blocks: usize) -> usize {
+        let Some(table) = self.block_tables.get_mut(&seq_id) else {
+            return 0;
+        };
+        let mut freed = 0;
+        for _ in 0..num_blocks {
+            let Some(block) = table.pop_back() else {
+                break;
+            };
+            if block.deref_mut().is_gpu {
+                self.gpu_allocator.free_block(block);
+            } else {
+                self.cpu_allocator.free_block(block);
+            }
+            freed += 1;
+        }
+        freed
+    }
+
     pub fn cache_sequence(&mut self, sequence: &Sequence) {
         let Some(prefix_cache) = self.prefix_cache.as_mut() else {
             return;
