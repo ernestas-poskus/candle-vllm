@@ -51,7 +51,7 @@ dirs = "5.0.1"
 minijinja = { version = "2.10.2", features = ["builtins", "json"] }
 minijinja-contrib = { version = "2.10.2", features = ["pycompat"] }
 thiserror = "1.0.58"
-attention-rs = { git = "https://github.com/guoqingbao/attention.rs.git", version = "0.6.4", rev = "4570c4f98c70b7a9c4c5ea3f254d28cc41d27d1a" }
+attention-rs = { git = "https://github.com/guoqingbao/attention.rs.git", version = "0.6.4", rev = "2b2ad007bc7332427f8ec36a4e7bb3cea8dbd34c" }
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 lazy_static = { version = "1.4.0" }
 interprocess = "2.2.2"
