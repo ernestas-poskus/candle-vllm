@@ -887,6 +887,7 @@ impl DefaultLoader {
                         gguf_rank,
                         gguf_world_size,
                         gguf_comm.clone(),
+                        crate::openai::models::KvCacheDtype::get_global(),
                     )
                     .map_err(candle_core::Error::wrap)?;
                     let cfg = model.get_config().clone();

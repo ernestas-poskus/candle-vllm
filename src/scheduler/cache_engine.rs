@@ -393,7 +393,51 @@ impl CacheEngine {
 
         // NOTE(EricLBuehler): This may synchronize the CPU and GPU
         unsafe {
-            copy_blocks(key_caches, value_caches, src_to_dst)?;
+            copy_blocks(key_caches, value_caches, src_to_dst.clone())?;
+        }
+        drop(gpu_cache);
+        self.copy_turboquant(&src_to_dst)?;
+        Ok(())
+    }
+
+    /// Mirrors `copy()`'s block copy-on-write into the TurboQuant per-layer
+    /// buffers (`v_absmax`/`v_quant`, and `k_absmax`/`k_quant` for
+    /// turbo4/turbo3) — `copy()` above only copies the standard
+    /// `key_caches`/`value_caches` tensors via `copy_blocks`, which is fine
+    /// for `None`/turbo8's *standard* K storage, but leaves turboquant's
+    /// own buffers at the destination block completely untouched. Any
+    /// consumer relying on `blocks_to_copy` (prefix-cache copy-on-write —
+    /// e.g. a shared persona-reference/continuation-tail prefix that later
+    /// forks) would decode turbo8/turbo4/turbo3 V (and turbo4/turbo3 K)
+    /// from whatever stale/uninitialized data previously occupied the
+    /// destination block, silently corrupting attention for every token
+    /// whose KV lives there — not a crash, not a NaN, just wrong numbers
+    /// that compound as more blocks get shared/copied over a long session.
+    /// Root-caused from a real production run producing progressively
+    /// worse (not crashing) audio under `kv_compression: turbo8` with
+    /// `prefix_cache_enabled: true`.
+    fn copy_turboquant(&self, src_to_dst: &HashMap<usize, Vec<usize>>) -> Result<()> {
+        if attention_rs::get_turboquant_mode().is_none() {
+            return Ok(());
+        }
+        for layer_idx in 0..self.num_layers {
+            let copied = attention_rs::with_turboquant_layer(layer_idx, |layer, _mode| -> Result<()> {
+                for (&src, dsts) in src_to_dst.iter() {
+                    for &dst in dsts {
+                        let mapping = HashMap::from([(src, dst)]);
+                        attention_rs::cache::swap_blocks(&layer.v_absmax, &layer.v_absmax, &mapping)?;
+                        attention_rs::cache::swap_blocks(&layer.v_quant, &layer.v_quant, &mapping)?;
+                        if let (Some(k_absmax), Some(k_quant)) = (&layer.k_absmax, &layer.k_quant) {
+                            attention_rs::cache::swap_blocks(k_absmax, k_absmax, &mapping)?;
+                            attention_rs::cache::swap_blocks(k_quant, k_quant, &mapping)?;
+                        }
+                    }
+                }
+                Ok(())
+            });
+            if let Some(result) = copied {
+                result?;
+            }
         }
         Ok(())
     }
