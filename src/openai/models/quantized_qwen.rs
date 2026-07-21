@@ -150,6 +150,7 @@ impl GGUFQWen {
         rank: usize,
         world_size: usize,
         #[allow(unused_variables)] comm: Rc<Comm>,
+        kvcache_compression: KvCacheDtype,
     ) -> Result<Self> {
         let metadata = vb.first_content_metadata();
         let md_get = |s: &str| match metadata.get(s) {
@@ -245,6 +246,19 @@ impl GGUFQWen {
         // into_config hardcodes vocab_size: 0 (it doesn't have this value
         // available at that call site) - fill in the real one now.
         cfg.vocab_size = true_vocab_size;
+        // into_config also hardcodes kvcache_dtype: KvCacheDtype::Auto (it
+        // doesn't have the caller's requested compression mode available
+        // at that call site either) - wire up the real one now. Without
+        // this, `QuantizedAttention::new`'s `PagedAttention::new(...,
+        // config.kvcache_dtype.is_fp8_keys())` call always sees `Auto`
+        // (is_fp8_keys() == false) regardless of what `kv_compression` the
+        // caller configured, so `k_scale`/`v_scale` are never allocated —
+        // while the KV cache engine (built separately, from the same
+        // `kv_compression` option) still dispatches decode through the
+        // turbo8/fp8 kernels, which read a null scale pointer. Root-caused
+        // from a real production run producing progressively-corrupted
+        // (not NaN, not crashing) audio under `kv_compression: turbo8`.
+        cfg.kvcache_dtype = kvcache_compression;
         cfg.apply_runtime_rope_overrides(yarn_scaling_factor);
         let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, &cfg, device, true)?);
 
