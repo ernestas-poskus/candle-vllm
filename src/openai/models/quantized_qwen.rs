@@ -27,14 +27,38 @@ struct Mlp {
     dtype: DType,
 }
 
+/// `MOSS_FUSED_GLUE=0` disables the fused SwiGLU matvec (B3,
+/// moss rtf-beyond-17x phase-b) and forces the original unfused
+/// gate/silu/mul path — the A/B escape hatch. Cached on first read.
+fn fused_glu_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MOSS_FUSED_GLUE").map_or(true, |v| v != "0"))
+}
+
 impl Mlp {
     #[allow(unused_mut)]
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let w1 = self.feed_forward_w1.forward(xs)?;
-        let w3 = self.feed_forward_w3.forward(xs)?;
-        let mut y = self
-            .feed_forward_w2
-            .forward(&(candle_nn::ops::silu(&w1)? * w3)?)?;
+        // Fused silu(w1·x)*(w3·x) in one kernel with one shared activation
+        // quantization (CUDA + Q4K + decode-width batches; `Ok(None)` means
+        // not applicable and we take the unfused path below).
+        let gated = if fused_glu_enabled() {
+            candle_core::quantized::fused_swiglu_forward(
+                &self.feed_forward_w1,
+                &self.feed_forward_w3,
+                xs,
+            )?
+        } else {
+            None
+        };
+        let gated = match gated {
+            Some(t) => t,
+            None => {
+                let w1 = self.feed_forward_w1.forward(xs)?;
+                let w3 = self.feed_forward_w3.forward(xs)?;
+                (candle_nn::ops::silu(&w1)? * w3)?
+            }
+        };
+        let mut y = self.feed_forward_w2.forward(&gated)?;
         #[cfg(feature = "nccl")]
         if let Some(all_reduce) = &self.all_reduce {
             y = all_reduce.apply(&y.to_dtype(self.dtype)?)?;
