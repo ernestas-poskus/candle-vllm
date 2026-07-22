@@ -400,11 +400,23 @@ impl GGUFQWen {
         // over the true-vocab prefix between this and CandleBackbone, but
         // CandleBackbone's argmax always lands in-range while this path's
         // argmax without narrowing lands in the untrained padding tail).
-        let logits = self.output.forward(&hidden)?.to_dtype(DType::F32)?.narrow(
-            candle_core::D::Minus1,
-            0,
-            self.true_vocab_size,
-        )?;
+        // Narrow FIRST (on the raw output, before the dtype cast) and force
+        // the result contiguous on-device. The old order
+        // (`.to_dtype(F32)?.narrow(...)`) returned a strided last-dim view;
+        // downstream in-place copies of that non-contiguous view are what a
+        // CUDA-graph capture bakes in as row-wise staged copies — replayed
+        // graphs then keep re-reading capture-time row data for rows >= 1
+        // (row 0 aliases offset 0 and stays live). Root-caused 2026-07-23
+        // via a per-row replay-vs-eager probe in moss-tts: hidden bit-exact,
+        // logits row 0 exact, logits rows 1+ frozen at capture-time values.
+        // `.contiguous()` keeps the whole tail a flat device tensor so the
+        // captured copy is one D2D memcpy node.
+        let logits = self
+            .output
+            .forward(&hidden)?
+            .narrow(candle_core::D::Minus1, 0, self.true_vocab_size)?
+            .contiguous()?
+            .to_dtype(DType::F32)?;
         Ok((logits, hidden))
     }
 
