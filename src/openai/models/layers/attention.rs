@@ -9,7 +9,7 @@ use crate::openai::distributed::{
 use crate::openai::models::layers::qrmsnorm::QRmsNorm;
 use crate::openai::models::Config;
 use crate::{InputMetadata, PagedAttention};
-use candle_core::quantized::QMatMul;
+use candle_core::quantized::{QMatMul, QTensor};
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::var_builder::Shard;
 use candle_nn::RmsNorm;
@@ -778,10 +778,56 @@ impl Attention {
     }
 }
 
+/// `MOSS_FUSED_QKV=0` disables the fused q/k/v projection (C5,
+/// moss rtf-beyond-17x): with one rank and identical quant dtypes the
+/// three projection weights are concatenated row-wise at load
+/// (`QTensor::concat_rows`) so each decode step runs ONE matvec launch
+/// over the shared activation instead of three. Cached on first read.
+fn fused_qkv_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MOSS_FUSED_QKV").map_or(true, |v| v != "0"))
+}
+
+enum QkvProj {
+    Split {
+        wq: QMatMul,
+        wk: QMatMul,
+        wv: QMatMul,
+    },
+    Fused {
+        qkv: QMatMul,
+        q_rows: usize,
+        k_rows: usize,
+        v_rows: usize,
+    },
+}
+
+impl QkvProj {
+    /// Returns `(q_raw, k, v)` for `x` — one fused matvec + narrows, or
+    /// the original three matvecs.
+    fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        match self {
+            QkvProj::Split { wq, wk, wv } => {
+                Ok((wq.forward(x)?, wk.forward(x)?, wv.forward(x)?))
+            }
+            QkvProj::Fused {
+                qkv,
+                q_rows,
+                k_rows,
+                v_rows,
+            } => {
+                let out = qkv.forward(x)?;
+                let q = out.narrow(1, 0, *q_rows)?.contiguous()?;
+                let k = out.narrow(1, *q_rows, *k_rows)?.contiguous()?;
+                let v = out.narrow(1, *q_rows + *k_rows, *v_rows)?.contiguous()?;
+                Ok((q, k, v))
+            }
+        }
+    }
+}
+
 pub struct QuantizedAttention {
-    attention_wq: QMatMul,
-    attention_wk: QMatMul,
-    attention_wv: QMatMul,
+    qkv_proj: QkvProj,
     attention_bq: Option<Tensor>,
     attention_bk: Option<Tensor>,
     attention_bv: Option<Tensor>,
@@ -896,10 +942,47 @@ impl QuantizedAttention {
         let q_out_dim = attention_wq.shape().dims()[0];
         let attn_output_gate = q_out_dim == expected_q_dim * 2;
 
+        let qkv_proj = if fused_qkv_enabled()
+            && world_size == 1
+            && attention_wq.dtype() == attention_wk.dtype()
+            && attention_wq.dtype() == attention_wv.dtype()
+        {
+            let q_rows = attention_wq.shape().dims()[0];
+            let k_rows = attention_wk.shape().dims()[0];
+            let v_rows = attention_wv.shape().dims()[0];
+            match QTensor::concat_rows(
+                &[
+                    attention_wq.as_ref(),
+                    attention_wk.as_ref(),
+                    attention_wv.as_ref(),
+                ],
+                device,
+            ) {
+                Ok(fused) => QkvProj::Fused {
+                    qkv: QMatMul::from_arc(std::sync::Arc::new(fused))?,
+                    q_rows,
+                    k_rows,
+                    v_rows,
+                },
+                Err(err) => {
+                    tracing::warn!(%err, "fused qkv concat failed; using split projections");
+                    QkvProj::Split {
+                        wq: QMatMul::from_arc(attention_wq)?,
+                        wk: QMatMul::from_arc(attention_wk)?,
+                        wv: QMatMul::from_arc(attention_wv)?,
+                    }
+                }
+            }
+        } else {
+            QkvProj::Split {
+                wq: QMatMul::from_arc(attention_wq)?,
+                wk: QMatMul::from_arc(attention_wk)?,
+                wv: QMatMul::from_arc(attention_wv)?,
+            }
+        };
+
         Ok(QuantizedAttention {
-            attention_wq: QMatMul::from_arc(attention_wq)?,
-            attention_wk: QMatMul::from_arc(attention_wk)?,
-            attention_wv: QMatMul::from_arc(attention_wv)?,
+            qkv_proj,
             attention_bq,
             attention_bk,
             attention_bv,
@@ -942,9 +1025,7 @@ impl QuantizedAttention {
     ) -> Result<Tensor> {
         let (seq_len, _) = x.dims2()?;
 
-        let q_raw = self.attention_wq.forward(x)?;
-        let k = self.attention_wk.forward(x)?;
-        let v = self.attention_wv.forward(x)?;
+        let (q_raw, k, v) = self.qkv_proj.forward(x)?;
 
         let q_raw = if let Some(bq) = &self.attention_bq {
             q_raw.broadcast_add(bq)?
