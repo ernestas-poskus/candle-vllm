@@ -7,7 +7,7 @@ use tracing::warn;
 pub mod backend;
 pub mod openai;
 pub mod scheduler;
-pub use attention_rs::{InputMetadata, PagedAttention};
+pub use attention_rs::{InputMetadata, PagedAttention, reset_paged_attention_layer_counter};
 
 pub mod api;
 
