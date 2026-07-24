@@ -557,7 +557,11 @@ impl CacheEngine {
             layers.len(),
             num_gpu_blocks,
         );
-        attention_rs::init_turboquant_cache(mode, layers, cache_config.block_size);
+        let device_ordinal = match device.location() {
+            candle_core::DeviceLocation::Cuda { gpu_id } => gpu_id,
+            _ => 0,
+        };
+        attention_rs::init_turboquant_cache(device_ordinal, mode, layers, cache_config.block_size);
         Ok(())
     }
 
