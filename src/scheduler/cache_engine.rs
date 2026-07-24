@@ -43,6 +43,8 @@ pub struct CacheEngine {
     cpu_turboquant_cache: Option<Vec<attention_rs::TurboquantLayerCache>>,
     cpu_swap_enabled: bool,
     num_layers: usize,
+    /// CUDA device ordinal — keys the per-device turboquant cache.
+    device_ordinal: usize,
 }
 
 impl CacheEngine {
@@ -95,6 +97,10 @@ impl CacheEngine {
             cpu_turboquant_cache,
             cpu_swap_enabled,
             num_layers: model_config.kv_cache_num_layers(),
+            device_ordinal: match device.location() {
+                candle_core::DeviceLocation::Cuda { gpu_id } => gpu_id,
+                _ => 0,
+            },
         };
 
         if cache_config.kvcache_dtype.is_turboquant() && !device.is_cpu() {
@@ -348,7 +354,7 @@ impl CacheEngine {
         }
         let started = Instant::now();
         let mut bytes = 0usize;
-        if !Self::turboquant_full_mode() {
+        if !self.turboquant_full_mode() {
             for i in 0..self.num_layers {
                 let (src_key_cache, src_value_cache) = self.cpu_cache.get(i).unwrap();
                 let mut gpu_cache = self.get_kv_cache();
@@ -368,7 +374,7 @@ impl CacheEngine {
         }
         let started = Instant::now();
         let mut bytes = 0usize;
-        if !Self::turboquant_full_mode() {
+        if !self.turboquant_full_mode() {
             for i in 0..self.num_layers {
                 let gpu_cache = self.get_kv_cache();
                 let (src_key_cache, src_value_cache) = gpu_cache.get(i).unwrap().clone();
@@ -417,11 +423,11 @@ impl CacheEngine {
     /// worse (not crashing) audio under `kv_compression: turbo8` with
     /// `prefix_cache_enabled: true`.
     fn copy_turboquant(&self, src_to_dst: &HashMap<usize, Vec<usize>>) -> Result<()> {
-        if attention_rs::get_turboquant_mode().is_none() {
+        if attention_rs::get_turboquant_mode(self.device_ordinal).is_none() {
             return Ok(());
         }
         for layer_idx in 0..self.num_layers {
-            let copied = attention_rs::with_turboquant_layer(layer_idx, |layer, _mode| -> Result<()> {
+            let copied = attention_rs::with_turboquant_layer(self.device_ordinal, layer_idx, |layer, _mode| -> Result<()> {
                 for (&src, dsts) in src_to_dst.iter() {
                     for &dst in dsts {
                         let mapping = HashMap::from([(src, dst)]);
@@ -565,9 +571,9 @@ impl CacheEngine {
         Ok(())
     }
 
-    fn turboquant_full_mode() -> bool {
+    fn turboquant_full_mode(&self) -> bool {
         matches!(
-            attention_rs::get_turboquant_mode(),
+            attention_rs::get_turboquant_mode(self.device_ordinal),
             Some(attention_rs::TurboquantMode::Turbo4) | Some(attention_rs::TurboquantMode::Turbo3)
         )
     }
@@ -588,7 +594,8 @@ impl CacheEngine {
         };
         let mut bytes = 0usize;
         for (layer_idx, cpu_layer) in cpu_layers.iter().enumerate() {
-            let layer_bytes = attention_rs::with_turboquant_layer(layer_idx, |gpu_layer, _| {
+            let layer_bytes =
+                attention_rs::with_turboquant_layer(self.device_ordinal, layer_idx, |gpu_layer, _| {
                 let mut bytes = 0usize;
                 if swap_in {
                     bytes += Self::swap_tensor(&cpu_layer.v_absmax, &gpu_layer.v_absmax, mapping)?;
