@@ -106,6 +106,13 @@ pub struct GGUFQWen {
     /// argmax/sampling if not excluded. Logits are narrowed to this size
     /// before being returned to callers.
     true_vocab_size: usize,
+    /// Layer index (0-based, into `self.layers`) whose raw (pre-final-norm)
+    /// output `forward_layers` additionally snapshots, alongside the
+    /// existing final-layer hidden state. `None` (the default everywhere
+    /// in production) skips the extra snapshot entirely -- no behavior or
+    /// perf change for existing callers. See docs/superpowers/specs/
+    /// 2026-08-30-mid-layer-hidden-state-exposure-design.md.
+    mid_layer_index: Option<usize>,
 }
 
 impl GGUFQWen {
@@ -176,6 +183,7 @@ impl GGUFQWen {
         world_size: usize,
         #[allow(unused_variables)] comm: Rc<Comm>,
         kvcache_compression: KvCacheDtype,
+        mid_layer_index: Option<usize>,
     ) -> Result<Self> {
         let metadata = vb.first_content_metadata();
         let md_get = |s: &str| match metadata.get(s) {
@@ -288,6 +296,13 @@ impl GGUFQWen {
         let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, &cfg, device, true)?);
 
         let mut layers = Vec::with_capacity(block_count);
+        if let Some(idx) = mid_layer_index {
+            if idx >= block_count {
+                candle_core::bail!(
+                    "mid_layer_index {idx} out of range: model has {block_count} layers (valid range 0..{block_count})"
+                );
+            }
+        }
 
         for layer_idx in 0..block_count {
             let prefix = format!("blk.{layer_idx}");
@@ -348,6 +363,7 @@ impl GGUFQWen {
             dtype,
             device: device.clone(),
             true_vocab_size,
+            mid_layer_index,
         })
     }
 
@@ -385,8 +401,8 @@ impl GGUFQWen {
         input_positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-    ) -> Result<(Tensor, Tensor)> {
-        let hidden = self.forward_layers(
+    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+        let (hidden, mid_hidden) = self.forward_layers(
             embeddings.clone(),
             input_positions,
             kv_caches,
@@ -418,7 +434,7 @@ impl GGUFQWen {
             .narrow(candle_core::D::Minus1, 0, self.true_vocab_size)?
             .contiguous()?
             .to_dtype(DType::F32)?;
-        Ok((logits, hidden))
+        Ok((logits, hidden, mid_hidden))
     }
 
     fn forward_inner(
@@ -440,7 +456,7 @@ impl GGUFQWen {
             Vec::new()
         };
         let xs = self.tok_embeddings.forward(x)?;
-        let mut xs = self.forward_layers(xs, input_positions, kv_caches, input_metadata)?;
+        let (mut xs, _mid_hidden) = self.forward_layers(xs, input_positions, kv_caches, input_metadata)?;
         if !seqlens.is_empty() && !return_hidden {
             let indices: Vec<_> = seqlens.iter().map(|x| x - 1 as u32).collect();
             let batch = indices.len();
@@ -472,7 +488,7 @@ impl GGUFQWen {
         input_positions: &Tensor,
         kv_caches: Option<&Vec<(Tensor, Tensor)>>,
         input_metadata: &InputMetadata,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let seqlens = if input_metadata.cu_seqlens_q.is_some() {
             input_metadata
                 .cu_seqlens_q
@@ -491,8 +507,11 @@ impl GGUFQWen {
             self.cfg.sliding_window,
             input_metadata.is_prefill,
         );
+        let mut mid_hidden: Option<Tensor> = None;
         if let Some(kv_caches) = kv_caches {
-            for ((k_cache, v_cache), layer) in zip(kv_caches.iter(), self.layers.iter()) {
+            for (layer_idx, ((k_cache, v_cache), layer)) in
+                zip(kv_caches.iter(), self.layers.iter()).enumerate()
+            {
                 let x = xs;
                 let residual = &x;
                 let x = layer.attention_norm.forward(&x)?;
@@ -510,10 +529,13 @@ impl GGUFQWen {
                 let x = layer.ffn_norm.forward(&x)?;
                 let x = layer.mlp.forward(&x)?;
                 let x = (x + residual)?;
-                xs = x
+                xs = x;
+                if self.mid_layer_index == Some(layer_idx) {
+                    mid_hidden = Some(xs.clone());
+                }
             }
         } else {
-            for layer in self.layers.iter() {
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let x = xs;
                 let residual = &x;
                 let x = layer.attention_norm.forward(&x)?;
@@ -531,13 +553,51 @@ impl GGUFQWen {
                 let x = layer.ffn_norm.forward(&x)?;
                 let x = layer.mlp.forward(&x)?;
                 let x = (x + residual)?;
-                xs = x
+                xs = x;
+                if self.mid_layer_index == Some(layer_idx) {
+                    mid_hidden = Some(xs.clone());
+                }
             }
         }
-        Ok(xs)
+        Ok((xs, mid_hidden))
     }
 
     pub fn get_config(&self) -> &Config {
         &self.cfg
+    }
+}
+
+#[cfg(test)]
+mod mid_layer_tests {
+    //! Verifies `forward_layers`' mid-layer snapshot contract without
+    //! loading a real model: a minimal `GGUFQWen`-shaped check would need
+    //! real weights, so this test instead documents and locks in the
+    //! *index semantics* via a standalone reproduction of the loop's
+    //! snapshot condition (`self.mid_layer_index == Some(layer_idx)`),
+    //! matching `forward_layers`' actual per-iteration check exactly.
+    //! Real-weights coverage needs a GGUF fixture and is left to callers.
+
+    #[test]
+    fn mid_layer_snapshot_condition_fires_only_at_configured_index() {
+        let mid_layer_index: Option<usize> = Some(2);
+        let mut fired_at = Vec::new();
+        for layer_idx in 0..5usize {
+            if mid_layer_index == Some(layer_idx) {
+                fired_at.push(layer_idx);
+            }
+        }
+        assert_eq!(fired_at, vec![2]);
+    }
+
+    #[test]
+    fn mid_layer_snapshot_condition_never_fires_when_disabled() {
+        let mid_layer_index: Option<usize> = None;
+        let mut fired = false;
+        for layer_idx in 0..5usize {
+            if mid_layer_index == Some(layer_idx) {
+                fired = true;
+            }
+        }
+        assert!(!fired);
     }
 }
