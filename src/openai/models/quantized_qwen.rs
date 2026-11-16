@@ -437,6 +437,45 @@ impl GGUFQWen {
         Ok((logits, hidden, mid_hidden))
     }
 
+    /// [`Self::forward_from_embeddings`] for a prefill that only needs some
+    /// rows: `rows` (u32 indices into the packed tokens, e.g. each
+    /// sequence's last token) are selected before the final norm and the
+    /// output projection, and logits, hidden and mid hidden come back for
+    /// those rows only. The full-sequence call projects every prompt token
+    /// onto the vocabulary; with 64+ rows candle takes its large-M path and
+    /// dequantizes the whole output weight to F32 (~2.5 GB for Qwen3's 155k
+    /// vocabulary) plus two full logits tensors, which ran 24 GB cards out
+    /// of memory mid-prefill. Selected rows stay on the packed matvec path
+    /// that every decode step's logits already use.
+    pub fn forward_from_embeddings_rows(
+        &self,
+        embeddings: &Tensor,
+        input_positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+        rows: &Tensor,
+    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+        let (hidden, mid_hidden) = self.forward_layers(
+            embeddings.clone(),
+            input_positions,
+            kv_caches,
+            input_metadata,
+        )?;
+        let hidden = self.norm.forward(&hidden.index_select(rows, 0)?)?;
+        let mid_hidden = match mid_hidden {
+            Some(mid) => Some(mid.index_select(rows, 0)?),
+            None => None,
+        };
+        // Same narrow-then-contiguous order as `forward_from_embeddings`.
+        let logits = self
+            .output
+            .forward(&hidden)?
+            .narrow(candle_core::D::Minus1, 0, self.true_vocab_size)?
+            .contiguous()?
+            .to_dtype(DType::F32)?;
+        Ok((logits, hidden, mid_hidden))
+    }
+
     fn forward_inner(
         &self,
         x: &Tensor,
