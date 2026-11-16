@@ -969,15 +969,6 @@ impl Attention {
     }
 }
 
-/// `CANDLE_VLLM_FUSED_QKV=0` disables the fused q/k/v projection: with one rank and identical quant dtypes the
-/// three projection weights are concatenated row-wise at load
-/// (`QTensor::concat_rows`) so each decode step runs ONE matvec launch
-/// over the shared activation instead of three. Cached on first read.
-fn fused_qkv_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CANDLE_VLLM_FUSED_QKV").map_or(true, |v| v != "0"))
-}
-
 enum QkvProj {
     Split {
         wq: QMatMul,
@@ -1136,8 +1127,11 @@ impl QuantizedAttention {
         let q_out_dim = attention_wq.shape().dims()[0];
         let attn_output_gate = q_out_dim == expected_q_dim * 2;
 
-        let qkv_proj = if fused_qkv_enabled()
-            && world_size == 1
+        // Fused q/k/v: with one rank and identical quant dtypes the three
+        // projection weights are concatenated row-wise at load
+        // (`QTensor::concat_rows`), so each decode step runs one matvec over
+        // the shared activation instead of three.
+        let qkv_proj = if world_size == 1
             && attention_wq.dtype() == attention_wk.dtype()
             && attention_wq.dtype() == attention_wv.dtype()
         {
